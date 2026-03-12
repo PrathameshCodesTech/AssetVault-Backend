@@ -170,12 +170,53 @@ class VerificationRequestListCreateView(APIView):
                 {"detail": "Employee not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
+        # Validate explicit asset list
+        asset_ids = data["asset_ids"]
+        if len(asset_ids) != len(set(asset_ids)):
+            return Response(
+                {"detail": "Duplicate asset IDs in request."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        assets = list(
+            Asset.objects.filter(pk__in=asset_ids)
+            .select_related("category", "current_location", "assigned_to")
+        )
+        if len(assets) != len(asset_ids):
+            found_ids = {str(a.pk) for a in assets}
+            missing = [str(aid) for aid in asset_ids if str(aid) not in found_ids]
+            return Response(
+                {"detail": f"Asset(s) not found: {', '.join(missing[:5])}"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Verify all assets belong to the same employee
+        for a in assets:
+            if str(a.assigned_to_id) != str(employee.pk):
+                return Response(
+                    {
+                        "detail": (
+                            f"Asset '{a.asset_id}' is not assigned to employee '{employee.email}'. "
+                            f"All assets in one request must belong to the same employee."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         ref_code = data.get("reference_code") or f"VER-{cycle.code}-{secrets.token_hex(4).upper()}"
+
+        # Validate all assets are in scope for the sender
+        for a in assets:
+            if a.current_location_id and not location_in_scope(a.current_location_id, request.user):
+                return Response(
+                    {"detail": f"Asset '{a.asset_id}' is outside your allowed location scope."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # Resolve location_scope: explicit, auto-derived, or null (global)
+        from locations.models import LocationClosure, LocationNode
 
         location_scope = None
         if data.get("location_scope_id"):
-            from locations.models import LocationNode
-
             try:
                 location_scope = LocationNode.objects.get(
                     pk=data["location_scope_id"]
@@ -192,70 +233,90 @@ class VerificationRequestListCreateView(APIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
+            # Every asset must be inside the provided location_scope subtree
+            scope_desc_ids = set(
+                LocationClosure.objects.filter(ancestor=location_scope)
+                .values_list("descendant_id", flat=True)
+            )
+            for a in assets:
+                if a.current_location_id and a.current_location_id not in scope_desc_ids:
+                    return Response(
+                        {
+                            "detail": (
+                                f"Asset '{a.asset_id}' (location '{a.current_location.name if a.current_location else 'N/A'}') "
+                                f"is outside the supplied location scope."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
         scope = get_user_scope(request.user)
         if not scope["is_global"] and location_scope is None:
+            # Auto-derive: find the shallowest role-assignment location
+            # that covers all selected assets.
+            from access.models import UserRoleAssignment
+
+            root_loc_ids = list(
+                UserRoleAssignment.objects.filter(
+                    user=request.user, is_active=True, location__isnull=False
+                ).values_list("location_id", flat=True)
+            )
+            asset_loc_ids = {a.current_location_id for a in assets if a.current_location_id}
+            chosen = None
+            for rl_id in root_loc_ids:
+                desc_ids = set(
+                    LocationClosure.objects.filter(ancestor_id=rl_id)
+                    .values_list("descendant_id", flat=True)
+                )
+                if asset_loc_ids.issubset(desc_ids):
+                    chosen = rl_id
+                    break
+            if chosen is None:
+                return Response(
+                    {"detail": "Selected assets span multiple location scopes. Please narrow your selection."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            location_scope = LocationNode.objects.get(pk=chosen)
+
+        # Block if active request already exists for this employee+cycle
+        existing_vr = _get_existing_active_vr(cycle, employee)
+        if existing_vr is not None:
             return Response(
-                {"detail": "Scoped admins must supply a location_scope_id."},
+                {
+                    "detail": (
+                        f"Employee '{employee.email}' already has an active verification request "
+                        f"in cycle '{cycle.code}' (status: {existing_vr.status}). "
+                        f"Complete or cancel it before sending another."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Resend if an active request already exists for this employee+cycle
-        existing_vr = _get_existing_active_vr(cycle, employee)
-        if existing_vr is not None:
-            if existing_vr.status not in _RESENDABLE_STATUSES:
-                return Response(
-                    {
-                        "detail": (
-                            f"Employee already has an active verification request "
-                            f"(status: {existing_vr.status}). "
-                            f"Wait for them to complete it or cancel it first."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            vr = resend_verification_request(existing_vr, requested_by=request.user)
-            is_new = False
-        else:
-            try:
-                vr = create_verification_request(
-                    cycle=cycle,
-                    employee=employee,
-                    requested_by=request.user,
-                    location_scope=location_scope,
-                    reference_code=ref_code,
-                )
-            except ValueError as exc:
-                return Response(
-                    {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # Snapshot assets assigned to the employee (within location scope if given)
-            asset_qs = Asset.objects.filter(assigned_to=employee).select_related(
-                "category", "current_location"
+        try:
+            vr = create_verification_request(
+                cycle=cycle,
+                employee=employee,
+                requested_by=request.user,
+                location_scope=location_scope,
+                reference_code=ref_code,
             )
-            if location_scope:
-                from locations.models import LocationClosure
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
 
-                desc_ids = LocationClosure.objects.filter(
-                    ancestor=location_scope
-                ).values_list("descendant_id", flat=True)
-                asset_qs = asset_qs.filter(current_location_id__in=desc_ids)
-
-            snapshot_request_assets(vr, asset_qs)
-            is_new = True
+        snapshot_request_assets(vr, assets)
 
         _record, sent_ok = _dispatch_magic_link_email(vr, employee, cycle)
         if not sent_ok:
-            if is_new:
-                vr.delete()
+            vr.delete()
             return Response(
                 {"detail": "Unable to send verification email. Please try again shortly."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        if is_new:
-            vr.sent_at = timezone.now()
-            vr.save(update_fields=["sent_at", "updated_at"])
+        vr.sent_at = timezone.now()
+        vr.save(update_fields=["sent_at", "updated_at"])
 
         result = VerificationRequestDetailSerializer(vr).data
         return Response(result, status=status.HTTP_201_CREATED)
@@ -727,55 +788,69 @@ class QuickSendVerificationView(APIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-        # Resend if an active request already exists for this employee+cycle
+        # Block if active request already exists for this employee+cycle
         existing_vr = _get_existing_active_vr(cycle, employee)
         if existing_vr is not None:
-            if existing_vr.status not in _RESENDABLE_STATUSES:
-                return Response(
-                    {
-                        "detail": (
-                            f"Employee already has an active verification request "
-                            f"(status: {existing_vr.status}). "
-                            f"Wait for them to complete it or cancel it first."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            vr = resend_verification_request(existing_vr, requested_by=request.user)
-            is_new = False
-        else:
-            ref_code = f"VER-{cycle.code}-{_secrets.token_hex(4).upper()}"
-            try:
-                vr = create_verification_request(
-                    cycle=cycle,
-                    employee=employee,
-                    requested_by=request.user,
-                    location_scope=location_scope,
-                    reference_code=ref_code,
-                )
-            except ValueError as exc:
-                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
-            asset_qs = Asset.objects.filter(pk=asset.pk).select_related(
-                "category", "current_location"
+            return Response(
+                {
+                    "detail": (
+                        f"Employee '{employee.email}' already has an active verification request "
+                        f"in cycle '{cycle.code}' (status: {existing_vr.status}). "
+                        f"Complete or cancel it before sending another."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            snapshot_request_assets(vr, asset_qs)
-            is_new = True
+
+        ref_code = f"VER-{cycle.code}-{_secrets.token_hex(4).upper()}"
+        try:
+            vr = create_verification_request(
+                cycle=cycle,
+                employee=employee,
+                requested_by=request.user,
+                location_scope=location_scope,
+                reference_code=ref_code,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        asset_qs = Asset.objects.filter(pk=asset.pk).select_related(
+            "category", "current_location"
+        )
+        snapshot_request_assets(vr, asset_qs)
 
         _record, sent_ok = _dispatch_magic_link_email(vr, employee, cycle)
         if not sent_ok:
-            if is_new:
-                vr.delete()
+            vr.delete()
             return Response(
                 {"detail": "Unable to send verification email. Please try again shortly."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        if is_new:
-            vr.sent_at = timezone.now()
-            vr.save(update_fields=["sent_at", "updated_at"])
+        vr.sent_at = timezone.now()
+        vr.save(update_fields=["sent_at", "updated_at"])
 
         return Response(
             VerificationRequestDetailSerializer(vr).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class SendSelectedAssetsVerificationView(APIView):
+    """
+    POST /api/verification/requests/send-selected
+
+    Send a verification request for explicitly selected assets.
+    Alias for VerificationRequestListCreateView.post with the same payload.
+
+    Payload:
+        cycle_id:          UUID
+        employee_id:       UUID
+        asset_ids:         [UUID, ...]
+        location_scope_id: UUID (optional)
+    """
+
+    permission_classes = [IsAuthenticated, permission_required("verification.request")]
+
+    def post(self, request):
+        return VerificationRequestListCreateView().post(request)

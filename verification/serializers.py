@@ -200,6 +200,9 @@ class VerificationIssueSerializer(serializers.ModelSerializer):
 class CreateVerificationRequestSerializer(serializers.Serializer):
     cycle_id = serializers.UUIDField()
     employee_id = serializers.UUIDField()
+    asset_ids = serializers.ListField(
+        child=serializers.UUIDField(), min_length=1, help_text="Explicit list of asset UUIDs to include."
+    )
     location_scope_id = serializers.UUIDField(required=False, allow_null=True)
     reference_code = serializers.CharField(max_length=100, required=False)
 

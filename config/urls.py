@@ -35,7 +35,6 @@ from submissions.views import (
     ThirdPartyAddAssetView,
     ThirdPartyVerifyView,
 )
-from verification.views import VerificationRequestListCreateView
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +96,13 @@ class AssetGenerateQRView(APIView):
 
 
 class SendVerificationRequestAliasView(APIView):
-    """POST /api/admin/send-verification-request"""
+    """POST /api/admin/send-verification-request — single-asset compat alias."""
 
     permission_classes = [IsAuthenticated, permission_required("verification.request")]
 
     def post(self, request):
-        return VerificationRequestListCreateView.as_view()(request._request)
+        from verification.views import QuickSendVerificationView
+        return QuickSendVerificationView.as_view()(request._request)
 
 
 # ---------------------------------------------------------------------------
