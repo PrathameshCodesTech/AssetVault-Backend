@@ -164,6 +164,9 @@ def assign_asset(
     Returns:
         The newly created AssetAssignment.
     """
+    # Capture previous assignee before mutation for audit trail
+    previous_user = asset.assigned_to
+
     # Close any existing open assignment at start_at, not timezone.now().
     # Using timezone.now() here produces wrong history for backdated or
     # scheduled assignments and can trip the model-level overlap validation
@@ -189,11 +192,24 @@ def assign_asset(
     asset.assigned_to = user
     asset.save(update_fields=["assigned_to", "updated_at"])
 
+    if previous_user:
+        description = f"Reassigned from '{previous_user.email}' to '{user.email}'."
+        meta = {
+            "from_user_id": str(previous_user.pk),
+            "from_user_email": previous_user.email,
+            "to_user_id": str(user.pk),
+            "to_user_email": user.email,
+        }
+    else:
+        description = f"Assigned to '{user.email}'."
+        meta = {"to_user_id": str(user.pk), "to_user_email": user.email}
+
     create_asset_event(
         asset,
         AssetEvent.EventType.REASSIGNED,
         actor=assigned_by,
-        description=f"Asset assigned to '{user.email}'.",
+        description=description,
+        metadata=meta,
     )
     return assignment
 

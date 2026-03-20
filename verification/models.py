@@ -84,6 +84,9 @@ class VerificationRequest(models.Model):
         OPENED = "opened", "Opened"
         OTP_VERIFIED = "otp_verified", "OTP Verified"
         SUBMITTED = "submitted", "Submitted"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        CORRECTION_REQUESTED = "correction_requested", "Correction Requested"
         EXPIRED = "expired", "Expired"
         CANCELLED = "cancelled", "Cancelled"
 
@@ -126,6 +129,9 @@ class VerificationRequest(models.Model):
         max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True
     )
 
+    # Admin review notes — set by admin when approving/rejecting
+    review_notes = models.TextField(blank=True, null=True)
+
     # Audit timestamps — set by the service layer, not auto_now
     sent_at = models.DateTimeField(null=True, blank=True)
     opened_at = models.DateTimeField(null=True, blank=True)
@@ -139,7 +145,7 @@ class VerificationRequest(models.Model):
     # Statuses where the employee is still expected to act — only one of these
     # may exist per employee per cycle at any time. Terminal statuses (submitted,
     # expired, cancelled) are historical and do not block a new request.
-    ACTIVE_STATUSES = {Status.PENDING, Status.OPENED, Status.OTP_VERIFIED}
+    ACTIVE_STATUSES = {Status.PENDING, Status.OPENED, Status.OTP_VERIFIED, Status.REJECTED, Status.CORRECTION_REQUESTED}
 
     class Meta:
         db_table = "verification_request"
@@ -244,6 +250,11 @@ class AssetVerificationResponse(models.Model):
         VERIFIED = "verified", "Verified"
         ISSUE_REPORTED = "issue_reported", "Issue Reported"
 
+    class AdminReviewStatus(models.TextChoices):
+        PENDING_REVIEW = "pending_review", "Pending Review"
+        APPROVED = "approved", "Approved"
+        CORRECTION_REQUIRED = "correction_required", "Correction Required"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request_asset = models.OneToOneField(
         VerificationRequestAsset,
@@ -253,6 +264,24 @@ class AssetVerificationResponse(models.Model):
     response = models.CharField(max_length=20, choices=Response.choices, db_index=True)
     remarks = models.TextField(blank=True, null=True)
     responded_at = models.DateTimeField(null=True, blank=True)
+
+    # Admin review fields — set during partial/full review
+    admin_review_status = models.CharField(
+        max_length=20,
+        choices=AdminReviewStatus.choices,
+        default=AdminReviewStatus.PENDING_REVIEW,
+        db_index=True,
+    )
+    admin_review_note = models.TextField(blank=True, null=True)
+    admin_reviewed_at = models.DateTimeField(null=True, blank=True)
+    admin_reviewed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reviewed_asset_responses",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -383,3 +412,78 @@ class VerificationAssetPhoto(models.Model):
 
     def __str__(self):
         return f"Photo for {self.request_asset}"
+
+
+# ---------------------------------------------------------------------------
+# Employee Asset Report (missing / misplaced / unlisted)
+# ---------------------------------------------------------------------------
+
+
+def _employee_report_photo_path(instance, filename):
+    return f"verification/reports/{instance.report_id}/photos/{filename}"
+
+
+class EmployeeAssetReport(models.Model):
+    """An asset reported by an employee during the verification portal flow.
+
+    This is NOT a VerificationRequestAsset — it captures assets that the employee
+    wants to flag as missing, misplaced, or otherwise not part of the original
+    verification list.  It links to the VerificationRequest so admin can review
+    it alongside the normal verification results.
+    """
+
+    class ReportType(models.TextChoices):
+        MISSING = "missing", "Missing Asset"
+        MISPLACED = "misplaced", "Misplaced Asset"
+        UNLISTED = "unlisted", "Unlisted / Extra Asset Found"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending Review"
+        ACKNOWLEDGED = "acknowledged", "Acknowledged"
+        RESOLVED = "resolved", "Resolved"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    verification_request = models.ForeignKey(
+        VerificationRequest,
+        on_delete=models.CASCADE,
+        related_name="employee_reports",
+    )
+    report_type = models.CharField(max_length=20, choices=ReportType.choices)
+    asset_name = models.CharField(max_length=300)
+    asset_id_if_known = models.CharField(max_length=100, blank=True, null=True)
+    serial_number = models.CharField(max_length=200, blank=True, null=True)
+    category_name = models.CharField(max_length=200, blank=True, null=True)
+    location_description = models.CharField(max_length=500, blank=True, null=True)
+    expected_location = models.CharField(max_length=500, blank=True, null=True)
+    remarks = models.TextField(blank=True, null=True)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "verification_employee_asset_report"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"{self.report_type}: {self.asset_name} ({self.verification_request.reference_code})"
+
+
+class EmployeeReportPhoto(models.Model):
+    """Photos attached to an EmployeeAssetReport."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report = models.ForeignKey(
+        EmployeeAssetReport,
+        on_delete=models.CASCADE,
+        related_name="photos",
+    )
+    image = models.ImageField(upload_to=_employee_report_photo_path)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "verification_employee_report_photo"
+
+    def __str__(self):
+        return f"Photo for report {self.report_id}"

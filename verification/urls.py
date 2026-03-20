@@ -1,7 +1,9 @@
 from django.urls import path
 
 from verification.views import (
+    AdminReviewVerificationView,
     CancelVerificationRequestView,
+    PublicReportAssetView,
     PublicSendOtpView,
     PublicSubmitView,
     PublicUploadAssetPhotoView,
@@ -26,10 +28,12 @@ urlpatterns = [
     path("requests/<uuid:pk>/", VerificationRequestDetailView.as_view(), name="request-detail"),
     path("requests/<uuid:pk>/resend/", ResendVerificationRequestView.as_view(), name="request-resend"),
     path("requests/<uuid:pk>/cancel/", CancelVerificationRequestView.as_view(), name="request-cancel"),
+    path("requests/<uuid:pk>/review/", AdminReviewVerificationView.as_view(), name="request-review"),
     # Public portal
     path("public/<str:token>/", PublicVerificationRequestView.as_view(), name="public-request"),
     path("public/<str:token>/otp/send/", PublicSendOtpView.as_view(), name="public-otp-send"),
     path("public/<str:token>/otp/verify/", PublicVerifyOtpView.as_view(), name="public-otp-verify"),
     path("public/<str:token>/assets/<uuid:asset_id>/photos/", PublicUploadAssetPhotoView.as_view(), name="public-asset-photo-upload"),
+    path("public/<str:token>/report-asset/", PublicReportAssetView.as_view(), name="public-report-asset"),
     path("public/<str:token>/submit/", PublicSubmitView.as_view(), name="public-submit"),
 ]

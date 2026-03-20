@@ -6,7 +6,7 @@ and update_or_create so existing data is never duplicated.
 """
 from django.core.management.base import BaseCommand
 
-from access.models import Permission, Role, RolePermission
+from access.models import Permission, PermissionTemplate, PermissionTemplatePermission, Role, RolePermission
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,11 @@ ROLES = [
         "name": "Employee",
         "description": "Verify assigned assets",
     },
+    {
+        "code": "vendor",
+        "name": "Vendor",
+        "description": "Respond to assigned vendor verification requests",
+    },
 ]
 
 PERMISSIONS = [
@@ -43,9 +48,6 @@ PERMISSIONS = [
     # module: verification
     {"code": "verification.request", "name": "Request Verification", "module": "verification"},
     {"code": "verification.respond", "name": "Respond to Verification", "module": "verification"},
-    # module: submissions
-    {"code": "submission.create", "name": "Create Submission", "module": "submissions"},
-    {"code": "submission.review", "name": "Review Submissions", "module": "submissions"},
     # module: reports
     {"code": "report.view",     "name": "View Reports",      "module": "reports"},
     # module: dashboard
@@ -53,7 +55,80 @@ PERMISSIONS = [
     # module: users
     {"code": "user.manage",  "name": "Manage Users",         "module": "users"},
     {"code": "role.manage",  "name": "Manage Roles",         "module": "users"},
+    # module: vendors
+    {"code": "vendor.manage",  "name": "Manage Vendor Organizations", "module": "vendors"},
+    {"code": "vendor.request", "name": "Create/View Vendor Requests", "module": "vendors"},
+    {"code": "vendor.respond", "name": "Respond to Vendor Requests",  "module": "vendors"},
 ]
+
+PERMISSION_TEMPLATES = [
+    {
+        "code": "super_admin_template",
+        "name": "Super Admin",
+        "description": "Full system access — all permissions.",
+        "sort_order": 10,
+    },
+    {
+        "code": "location_admin_template",
+        "name": "Location Admin",
+        "description": "Manage assets and verification within assigned locations.",
+        "sort_order": 20,
+    },
+    {
+        "code": "employee_template",
+        "name": "Employee",
+        "description": "Verify assigned assets and view dashboard.",
+        "sort_order": 30,
+    },
+    {
+        "code": "asset_operations_template",
+        "name": "Asset Operations",
+        "description": "Full asset management including import and assignment.",
+        "sort_order": 40,
+    },
+    {
+        "code": "vendor_template",
+        "name": "Vendor",
+        "description": "Respond to vendor verification requests, view assigned assets, upload photos.",
+        "sort_order": 50,
+    },
+]
+
+# Maps template code → list of permission codes included in that template
+TEMPLATE_PERMISSION_MAP: dict[str, list[str]] = {
+    "super_admin_template": [p["code"] for p in PERMISSIONS],
+    "location_admin_template": [
+        "asset.view",
+        "asset.create",
+        "asset.update",
+        "asset.assign",
+        "asset.import",
+        "location.view",
+        "verification.request",
+        "vendor.request",
+        "report.view",
+        "dashboard.view",
+    ],
+    "employee_template": [
+        "asset.view",
+        "verification.respond",
+        "dashboard.view",
+    ],
+    "asset_operations_template": [
+        "asset.view",
+        "asset.create",
+        "asset.update",
+        "asset.assign",
+        "asset.import",
+        "location.view",
+    ],
+    "vendor_template": [
+        "asset.view",
+        "location.view",
+        "vendor.respond",
+        "dashboard.view",
+    ],
+}
 
 # Maps role code → list of permission codes assigned to that role
 ROLE_PERMISSION_MAP = {
@@ -66,13 +141,19 @@ ROLE_PERMISSION_MAP = {
         "asset.import",
         "location.view",
         "verification.request",
-        "submission.review",
+        "vendor.request",
         "report.view",
         "dashboard.view",
     ],
     "employee": [
         "asset.view",
         "verification.respond",
+        "dashboard.view",
+    ],
+    "vendor": [
+        "asset.view",
+        "location.view",
+        "vendor.respond",
         "dashboard.view",
     ],
 }
@@ -168,12 +249,60 @@ class Command(BaseCommand):
                     mappings_created += 1
 
         # ----------------------------------------------------------------
+        # Upsert permission templates
+        # ----------------------------------------------------------------
+        self.stdout.write("Seeding permission templates...")
+        templates_created = 0
+        templates_updated = 0
+        template_mappings_created = 0
+        template_cache: dict[str, PermissionTemplate] = {}
+
+        for tmpl_data in PERMISSION_TEMPLATES:
+            obj, created = PermissionTemplate.objects.update_or_create(
+                code=tmpl_data["code"],
+                defaults={
+                    "name": tmpl_data["name"],
+                    "description": tmpl_data["description"],
+                    "sort_order": tmpl_data["sort_order"],
+                },
+            )
+            template_cache[obj.code] = obj
+            if created:
+                templates_created += 1
+                self.stdout.write(self.style.SUCCESS(f"  [CREATED] Template: {obj.code}"))
+            else:
+                templates_updated += 1
+                self.stdout.write(self.style.WARNING(f"  [UPDATED] Template: {obj.code}"))
+
+        # ----------------------------------------------------------------
+        # Map permissions to templates
+        # ----------------------------------------------------------------
+        self.stdout.write("Mapping permissions to templates...")
+        for tmpl_code, perm_codes in TEMPLATE_PERMISSION_MAP.items():
+            tmpl = template_cache.get(tmpl_code)
+            if tmpl is None:
+                self.stdout.write(self.style.ERROR(f"  [SKIP] Template '{tmpl_code}' not found."))
+                continue
+            for perm_code in perm_codes:
+                perm = perm_cache.get(perm_code)
+                if perm is None:
+                    self.stdout.write(self.style.ERROR(f"  [SKIP] Permission '{perm_code}' not found."))
+                    continue
+                _, created = PermissionTemplatePermission.objects.get_or_create(
+                    template=tmpl, permission=perm
+                )
+                if created:
+                    template_mappings_created += 1
+
+        # ----------------------------------------------------------------
         # Summary
         # ----------------------------------------------------------------
         self.stdout.write(
             self.style.SUCCESS(
                 f"\nDone. Created {roles_created} roles, updated {roles_updated} roles, "
                 f"created {perms_created} permissions, updated {perms_updated} permissions, "
-                f"mapped {mappings_created} role-permissions."
+                f"mapped {mappings_created} role-permissions. "
+                f"Created {templates_created} templates, updated {templates_updated} templates, "
+                f"mapped {template_mappings_created} template-permissions."
             )
         )

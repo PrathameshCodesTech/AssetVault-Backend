@@ -86,7 +86,7 @@ def _parse_file(uploaded_file):
                 mapped[key] = (value or "").strip()
             rows.append(mapped)
 
-    elif filename.endswith((".xlsx", ".xls")):
+    elif filename.endswith(".xlsx"):
         import openpyxl
 
         wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
@@ -107,7 +107,9 @@ def _parse_file(uploaded_file):
             rows.append(mapped)
         wb.close()
     else:
-        raise ValueError("Unsupported file format. Please upload CSV or XLSX.")
+        raise ValueError(
+            "Unsupported file format. Please upload a CSV or XLSX file."
+        )
 
     return rows
 

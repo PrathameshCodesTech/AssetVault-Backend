@@ -239,10 +239,11 @@ def submit_verification_request(
     verification_request: VerificationRequest,
 ) -> VerificationRequest:
     """
-    Submit a verification request that has been OTP-verified by the employee.
+    Submit a verification request through the employee public verification flow.
 
-    Validates that the request is in OTP_VERIFIED state, marks it SUBMITTED,
-    and propagates asset reconciliation statuses based on the employee's responses.
+    Validates that the request is in an active employee-actionable state,
+    marks it SUBMITTED, and propagates asset reconciliation statuses based
+    on the employee's responses.
 
     Args:
         verification_request: The VerificationRequest to submit.
@@ -251,12 +252,16 @@ def submit_verification_request(
         The updated VerificationRequest with status SUBMITTED.
 
     Raises:
-        ValueError: If the request is not in OTP_VERIFIED state.
+        ValueError: If the request is not in an employee-submittable state.
     """
-    if verification_request.status != VerificationRequest.Status.OTP_VERIFIED:
+    submittable_statuses = {
+        VerificationRequest.Status.OPENED,
+        VerificationRequest.Status.CORRECTION_REQUESTED,
+    }
+    if verification_request.status not in submittable_statuses:
         raise ValueError(
             f"Cannot submit a request with status '{verification_request.status}'. "
-            f"Only OTP_VERIFIED requests can be submitted."
+            f"Only OPENED or CORRECTION_REQUESTED requests can be submitted."
         )
 
     verification_request.status = VerificationRequest.Status.SUBMITTED

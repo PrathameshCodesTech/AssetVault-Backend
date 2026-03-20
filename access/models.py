@@ -3,6 +3,52 @@ from django.core.exceptions import ValidationError
 from django.db import models
 
 
+class PermissionTemplate(models.Model):
+    """A named, seeded grouping of existing permissions.
+
+    Templates are backend-controlled and exposed read-only to the frontend.
+    Superadmin can apply a template to a role to quickly configure it.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.CharField(max_length=100, unique=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "access_permission_template"
+        ordering = ("sort_order", "name")
+
+    def __str__(self):
+        return self.name
+
+
+class PermissionTemplatePermission(models.Model):
+    """Junction: maps a permission to a template."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    template = models.ForeignKey(
+        PermissionTemplate,
+        on_delete=models.CASCADE,
+        related_name="template_permissions",
+    )
+    permission = models.ForeignKey(
+        "Permission",
+        on_delete=models.CASCADE,
+        related_name="template_permissions",
+    )
+
+    class Meta:
+        db_table = "access_permission_template_permission"
+        unique_together = (("template", "permission"),)
+
+    def __str__(self):
+        return f"{self.template.code} → {self.permission.code}"
+
+
 class Role(models.Model):
     """A named role that can carry one or more permissions."""
 

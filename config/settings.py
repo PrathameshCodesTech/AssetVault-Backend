@@ -63,6 +63,7 @@ INSTALLED_APPS = [
     "assets",
     "verification",
     "submissions",
+    "vendors",
 ]
 
 MIDDLEWARE = [

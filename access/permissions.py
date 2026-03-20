@@ -6,6 +6,20 @@ from rest_framework.permissions import BasePermission
 from access.helpers import get_user_permission_codes
 
 
+class IsSuperAdmin(BasePermission):
+    """
+    Grants access only if the authenticated user has the 'super_admin' role code
+    in any of their active role assignments.
+    """
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        from access.helpers import get_user_scope
+        scope = get_user_scope(request.user)
+        return 'super_admin' in scope.get('role_codes', set())
+
+
 class HasPermission(BasePermission):
     """
     Usage: permission_classes = [HasPermission('asset.view')]

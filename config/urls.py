@@ -17,23 +17,10 @@ from assets.views.report_views import (
     ReconciliationReportView,
 )
 from submissions.views import (
-    AdminApproveAssetView,
-    AdminRejectAssetView,
-    AdminSubmissionApproveView,
-    AdminSubmissionCorrectionView,
-    AdminSubmissionConvertView,
-    AdminSubmissionDetailView,
-    AdminSubmissionListView,
-    AdminSubmissionRejectView,
-    AdminSubmissionReviewView,
     EmployeeAddMissingAssetView,
     EmployeeSubmitVerificationView,
     EmployeeVerifyAssetsView,
     ReconciliationSubmitView,
-    SubmissionDetailView,
-    SubmissionListCreateView,
-    ThirdPartyAddAssetView,
-    ThirdPartyVerifyView,
 )
 
 
@@ -117,7 +104,6 @@ urlpatterns = [
     path("api/assets/", include("assets.urls")),
     path("api/locations/", include("locations.urls")),
     path("api/verification/", include("verification.urls")),
-    path("api/submissions/", include("submissions.urls")),
 
     # ── Dashboard & reports ────────────────────────────────────────────
     path("api/dashboard/summary", DashboardSummaryView.as_view(), name="dashboard-summary"),
@@ -129,22 +115,7 @@ urlpatterns = [
     path("api/assets/upload", AssetUploadAliasView.as_view(), name="asset-upload-alias"),
     path("api/assets/generate-qr", AssetGenerateQRView.as_view(), name="asset-generate-qr"),
 
-    # ── /api/third-party/* ─────────────────────────────────────────────
-    path("api/third-party/submissions/", SubmissionListCreateView.as_view(), name="tp-submissions"),
-    path("api/third-party/submissions/<uuid:pk>/", SubmissionDetailView.as_view(), name="tp-submission-detail"),
-    path("api/third-party/verify", ThirdPartyVerifyView.as_view(), name="tp-verify"),
-    path("api/third-party/add-asset", ThirdPartyAddAssetView.as_view(), name="tp-add-asset"),
-
     # ── /api/admin/* ───────────────────────────────────────────────────
-    path("api/admin/submissions/", AdminSubmissionListView.as_view(), name="admin-submissions"),
-    path("api/admin/submissions/<uuid:pk>/", AdminSubmissionDetailView.as_view(), name="admin-submission-detail"),
-    path("api/admin/submissions/<uuid:pk>/review/", AdminSubmissionReviewView.as_view(), name="admin-submission-review"),
-    path("api/admin/submissions/<uuid:pk>/approve/", AdminSubmissionApproveView.as_view(), name="admin-submission-approve"),
-    path("api/admin/submissions/<uuid:pk>/reject/", AdminSubmissionRejectView.as_view(), name="admin-submission-reject"),
-    path("api/admin/submissions/<uuid:pk>/correction/", AdminSubmissionCorrectionView.as_view(), name="admin-submission-correction"),
-    path("api/admin/submissions/<uuid:pk>/convert-to-asset/", AdminSubmissionConvertView.as_view(), name="admin-submission-convert"),
-    path("api/admin/approve-asset", AdminApproveAssetView.as_view(), name="admin-approve-asset"),
-    path("api/admin/reject-asset", AdminRejectAssetView.as_view(), name="admin-reject-asset"),
     path("api/admin/send-verification-request", SendVerificationRequestAliasView.as_view(), name="admin-send-vr"),
 
     # ── /api/employee/* ────────────────────────────────────────────────
@@ -155,6 +126,17 @@ urlpatterns = [
     # ── /api/reconciliation/* ──────────────────────────────────────────
     path("api/reconciliation/report", ReconciliationReportView.as_view(), name="reconciliation-report-alias"),
     path("api/reconciliation/submit", ReconciliationSubmitView.as_view(), name="reconciliation-submit"),
+
+    # ── Superadmin management APIs ─────────────────────────────────────
+    path("api/admin/", include("access.urls_admin")),
+    path("api/admin/", include("accounts.urls_admin")),
+    path("api/admin/", include("assets.urls_admin")),
+    path("api/admin/", include("locations.urls_admin")),
+    path("api/admin/", include("verification.urls_admin")),
+    path("api/admin/", include("vendors.urls_admin")),
+
+    # ── Vendor (third-party) facing APIs ───────────────────────────────
+    path("api/vendor/", include("vendors.urls_vendor")),
 ]
 
 if settings.DEBUG:

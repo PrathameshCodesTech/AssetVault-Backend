@@ -178,7 +178,7 @@ class UserListView(ListAPIView):
     Supports ?search=<str> to filter by email, first_name, or last_name.
     """
 
-    permission_classes = [IsAuthenticated, permission_required("asset.create")]
+    permission_classes = [IsAuthenticated, permission_required("asset.create", "verification.request")]
     serializer_class = UserOptionSerializer
 
     def get_queryset(self):

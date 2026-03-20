@@ -158,6 +158,16 @@ class AssetListSerializer(serializers.ModelSerializer):
     imageUrl = serializers.SerializerMethodField()
     createdAt = serializers.DateTimeField(source="created_at")
     updatedAt = serializers.DateTimeField(source="updated_at")
+    # Vendor reservation fields (populated via annotated queryset)
+    vendorRequestId = serializers.SerializerMethodField()
+    vendorRequestReference = serializers.SerializerMethodField()
+    vendorRequestStatus = serializers.SerializerMethodField()
+    vendorName = serializers.SerializerMethodField()
+    # Unified workflow status (employee > vendor > available)
+    workflowType = serializers.SerializerMethodField()
+    workflowStatus = serializers.SerializerMethodField()
+    workflowReference = serializers.SerializerMethodField()
+    workflowDisplay = serializers.SerializerMethodField()
 
     class Meta:
         model = Asset
@@ -183,6 +193,14 @@ class AssetListSerializer(serializers.ModelSerializer):
             "imageUrl",
             "createdAt",
             "updatedAt",
+            "vendorRequestId",
+            "vendorRequestReference",
+            "vendorRequestStatus",
+            "vendorName",
+            "workflowType",
+            "workflowStatus",
+            "workflowReference",
+            "workflowDisplay",
         ]
 
     def get_subAssetType(self, obj):
@@ -213,6 +231,53 @@ class AssetListSerializer(serializers.ModelSerializer):
             if images and images[0].image:
                 return images[0].image.url
         return None
+
+    # ------------------------------------------------------------------
+    # Vendor reservation fields — read from annotation injected by the view
+    # ------------------------------------------------------------------
+
+    def _vendor_info(self, obj):
+        """Return the cached vendor reservation annotation dict, or None."""
+        return getattr(obj, "_vendor_reservation", None)
+
+    def get_vendorRequestId(self, obj):
+        info = self._vendor_info(obj)
+        return str(info["request_id"]) if info else None
+
+    def get_vendorRequestReference(self, obj):
+        info = self._vendor_info(obj)
+        return info["reference_code"] if info else None
+
+    def get_vendorRequestStatus(self, obj):
+        info = self._vendor_info(obj)
+        return info["status"] if info else None
+
+    def get_vendorName(self, obj):
+        info = self._vendor_info(obj)
+        return info["vendor_name"] if info else None
+
+    # ------------------------------------------------------------------
+    # Unified workflow fields
+    # ------------------------------------------------------------------
+
+    def _wf(self, obj):
+        return getattr(obj, "_workflow", None)
+
+    def get_workflowType(self, obj):
+        w = self._wf(obj)
+        return w["type"] if w else None
+
+    def get_workflowStatus(self, obj):
+        w = self._wf(obj)
+        return w["status"] if w else "available"
+
+    def get_workflowReference(self, obj):
+        w = self._wf(obj)
+        return w["reference"] if w else None
+
+    def get_workflowDisplay(self, obj):
+        w = self._wf(obj)
+        return w["display"] if w else "Available"
 
 
 # ---- Asset detail serializer ----
