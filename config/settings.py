@@ -221,4 +221,4 @@ EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "0").strip().lower() in ("1", "true",
 EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
 
 # ------- Frontend -------
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:8081")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:8080")

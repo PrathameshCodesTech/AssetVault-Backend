@@ -97,7 +97,7 @@ class SendVerificationRequestAliasView(APIView):
 # ---------------------------------------------------------------------------
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
+    path("django-admin/", admin.site.urls),
 
     # ── Core API routes ────────────────────────────────────────────────
     path("api/auth/", include("accounts.urls")),

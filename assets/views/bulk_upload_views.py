@@ -149,7 +149,7 @@ class BulkUploadPreviewView(APIView):
 
         # Create import job
         job = create_import_job(uploaded_by=request.user, source_file=uploaded_file)
-        validate_import_rows(job, parsed_rows)
+        validate_import_rows(job, parsed_rows, user=request.user)
 
         # Build preview
         rows_qs = job.rows.all().order_by("row_number")

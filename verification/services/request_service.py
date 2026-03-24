@@ -42,12 +42,15 @@ def create_verification_request(
     requested_by=None,
     location_scope=None,
     reference_code: str,
+    request_type: str = VerificationRequest.RequestType.INITIAL,
 ) -> VerificationRequest:
     """
     Create a new VerificationRequest for an employee within a cycle.
 
-    Validates that no active (pending / opened / otp_verified) request already
-    exists for this employee+cycle combination. Raises ValueError if one does.
+    Multiple requests per employee per cycle are allowed; enforcement is
+    asset-level (an asset cannot be in two active requests simultaneously).
+    Asset-level conflict detection is the caller's responsibility before
+    invoking this function.
 
     Args:
         cycle:           VerificationCycle instance.
@@ -56,22 +59,11 @@ def create_verification_request(
         location_scope:  locations.LocationNode to restrict scope (optional).
         reference_code:  Human-readable reference code (e.g. "VER-2526-00042").
                          Must be unique — caller is responsible for generating it.
+        request_type:    One of VerificationRequest.RequestType (default: initial).
 
     Returns:
         The newly created VerificationRequest with status PENDING.
     """
-    # Guard: only one active request per employee per cycle
-    active_qs = VerificationRequest.objects.filter(
-        cycle=cycle,
-        employee=employee,
-        status__in=list(VerificationRequest.ACTIVE_STATUSES),
-    )
-    if active_qs.exists():
-        raise ValueError(
-            f"Employee '{employee.email}' already has an active verification request "
-            f"in cycle '{cycle.code}'. Cancel or expire it before issuing a new one."
-        )
-
     verification_request = VerificationRequest.objects.create(
         cycle=cycle,
         employee=employee,
@@ -80,6 +72,7 @@ def create_verification_request(
         reference_code=reference_code,
         public_token=_generate_public_token(),
         status=VerificationRequest.Status.PENDING,
+        request_type=request_type,
     )
     return verification_request
 

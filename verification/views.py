@@ -29,6 +29,7 @@ from verification.models import (
     VerificationIssue,
     VerificationRequest,
     VerificationRequestAsset,
+    is_blocking_correction_request,
 )
 from verification.serializers import (
     CreateVerificationRequestSerializer,
@@ -57,17 +58,6 @@ _RESENDABLE_STATUSES = {
 }
 
 
-def _get_existing_active_vr(cycle, employee):
-    """Return the most recent active VerificationRequest for this employee+cycle, or None."""
-    return (
-        VerificationRequest.objects.filter(
-            cycle=cycle,
-            employee=employee,
-            status__in=list(VerificationRequest.ACTIVE_STATUSES),
-        )
-        .order_by("-created_at")
-        .first()
-    )
 
 
 def _dispatch_magic_link_email(vr, employee, cycle):
@@ -75,7 +65,7 @@ def _dispatch_magic_link_email(vr, employee, cycle):
 
     Employee access is link-based — no OTP step required.
     """
-    frontend_base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:8081")
+    frontend_base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:8080")
     verify_url = f"{frontend_base}/verify/{vr.public_token}"
     return send_tracked_email(
         to_email=employee.email,
@@ -243,12 +233,10 @@ class VerificationRequestListCreateView(APIView):
         except ImportError:
             pass
 
-        # Asset-level duplicate guard: block if any asset is already in an active
-        # employee verification request (any cycle, any status in ACTIVE_STATUSES).
-        # This prevents the same asset appearing in two concurrent active requests
-        # across different cycles. The force_reassign path in AssetAssignView evicts
-        # the asset from its old request before reassigning, so after a reassignment
-        # this guard will no longer fire for the new owner.
+        # Asset-level duplicate guard: an asset cannot be in two active employee
+        # verification requests simultaneously, regardless of employee or cycle.
+        # correction_requested requests with no remaining correction_required assets
+        # are non-blocking and do not prevent the asset from appearing in a new request.
         for a in assets:
             existing_vra = (
                 VerificationRequestAsset.objects
@@ -261,25 +249,28 @@ class VerificationRequestListCreateView(APIView):
             )
             if existing_vra:
                 existing_vr = existing_vra.verification_request
-                # Allow if it's the same cycle+employee (handled by _get_existing_active_vr below)
-                # so only surface a distinct conflict for cross-cycle duplicates
-                if not (existing_vr.cycle_id == cycle.pk and existing_vr.employee_id == employee.pk):
-                    return Response(
-                        {
-                            "detail": (
-                                f"Asset '{a.asset_id}' is already in active verification request "
-                                f"'{existing_vr.reference_code}' (cycle '{existing_vr.cycle.code}') "
-                                f"for '{existing_vr.employee.email}'. "
-                                f"An asset cannot be in two active employee requests simultaneously."
-                            ),
-                            "conflict_type": "asset_in_active_request",
-                            "request_reference": existing_vr.reference_code,
-                            "employee_email": existing_vr.employee.email,
-                            "cycle_code": existing_vr.cycle.code,
-                            "asset_id": a.asset_id,
-                        },
-                        status=status.HTTP_409_CONFLICT,
-                    )
+                # Non-blocking correction_requested: all assets are approved or missing.
+                if (
+                    existing_vr.status == VerificationRequest.Status.CORRECTION_REQUESTED
+                    and not is_blocking_correction_request(existing_vr)
+                ):
+                    continue
+                return Response(
+                    {
+                        "detail": (
+                            f"Asset '{a.asset_id}' is already in active verification request "
+                            f"'{existing_vr.reference_code}' (cycle '{existing_vr.cycle.code}') "
+                            f"for '{existing_vr.employee.email}'. "
+                            f"An asset cannot be in two active employee requests simultaneously."
+                        ),
+                        "conflict_type": "asset_in_active_request",
+                        "request_reference": existing_vr.reference_code,
+                        "employee_email": existing_vr.employee.email,
+                        "cycle_code": existing_vr.cycle.code,
+                        "asset_id": a.asset_id,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         # Cycle-verified guard: block if any asset is already admin-approved in this cycle
         # unless the admin explicitly overrides with force_resend=true
@@ -380,19 +371,7 @@ class VerificationRequestListCreateView(APIView):
                 )
             location_scope = LocationNode.objects.get(pk=chosen)
 
-        # Block if active request already exists for this employee+cycle
-        existing_vr = _get_existing_active_vr(cycle, employee)
-        if existing_vr is not None:
-            return Response(
-                {
-                    "detail": (
-                        f"Employee '{employee.email}' already has an active verification request "
-                        f"in cycle '{cycle.code}' (status: {existing_vr.status}). "
-                        f"Complete or cancel it before sending another."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        request_type = data.get("request_type", VerificationRequest.RequestType.INITIAL)
 
         try:
             vr = create_verification_request(
@@ -401,6 +380,7 @@ class VerificationRequestListCreateView(APIView):
                 requested_by=request.user,
                 location_scope=location_scope,
                 reference_code=ref_code,
+                request_type=request_type,
             )
         except ValueError as exc:
             return Response(
@@ -561,27 +541,37 @@ class AdminReviewVerificationView(APIView):
 
         # Apply per-asset decisions
         now = timezone.now()
+        from assets.models import Asset as AssetModel
         for item in asset_reviews:
+            decision = item["decision"]
             AssetVerificationResponse.objects.filter(
                 request_asset_id=item["request_asset_id"]
             ).update(
-                admin_review_status=item["decision"],
+                admin_review_status=decision,
                 admin_review_note=item.get("note") or "",
                 admin_reviewed_at=now,
                 admin_reviewed_by=request.user,
             )
+            # If marked missing, update the asset master status to missing
+            if decision == AssetVerificationResponse.AdminReviewStatus.MISSING:
+                ra = vr.request_assets.filter(pk=item["request_asset_id"]).select_related("asset").first()
+                if ra and ra.asset:
+                    AssetModel.objects.filter(pk=ra.asset_id).update(status=AssetModel.Status.MISSING)
 
         # Derive request-level status from all per-asset decisions
         all_responses = AssetVerificationResponse.objects.filter(
             request_asset__verification_request=vr
         )
-        has_correction = all_responses.filter(
-            admin_review_status=AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED
+        has_correction_or_missing = all_responses.filter(
+            admin_review_status__in=[
+                AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED,
+                AssetVerificationResponse.AdminReviewStatus.MISSING,
+            ]
         ).exists()
 
         vr.review_notes = review_note
 
-        if has_correction:
+        if has_correction_or_missing:
             vr.status = VerificationRequest.Status.CORRECTION_REQUESTED
             vr.public_token = secrets.token_urlsafe(32)
             vr.save(update_fields=["status", "review_notes", "public_token", "updated_at"])
@@ -592,13 +582,16 @@ class AdminReviewVerificationView(APIView):
             correction_count = all_responses.filter(
                 admin_review_status=AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED
             ).count()
+            missing_count = all_responses.filter(
+                admin_review_status=AssetVerificationResponse.AdminReviewStatus.MISSING
+            ).count()
 
             email_sent = _dispatch_correction_email(
-                vr, vr.employee, vr.cycle, approved_count, correction_count, review_note
+                vr, vr.employee, vr.cycle, approved_count, correction_count, missing_count, review_note
             )
-            msg = "Correction requested. Employee has been notified."
+            msg = "Review submitted. Employee has been notified."
             if not email_sent:
-                msg = "Correction requested. Notification email could not be sent; please share the link manually."
+                msg = "Review submitted. Notification email could not be sent; please share the link manually."
             return Response({"detail": msg, "status": vr.status})
 
         else:
@@ -607,23 +600,25 @@ class AdminReviewVerificationView(APIView):
             return Response({"detail": "Verification approved.", "status": vr.status})
 
 
-def _dispatch_correction_email(vr, employee, cycle, approved_count, correction_count, review_note):
+def _dispatch_correction_email(vr, employee, cycle, approved_count, correction_count, missing_count, review_note):
     """Send correction-request email with per-asset counts. Returns True if sent."""
-    frontend_base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:8081")
+    frontend_base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:8080")
     verify_url = f"{frontend_base}/verify/{vr.public_token}"
     note_section = f"\n\nAdmin note:\n{review_note}" if review_note else ""
+    missing_line = f"  • {missing_count} asset(s) marked missing\n" if missing_count else ""
     _record, sent_ok = send_tracked_email(
         to_email=employee.email,
-        subject=f"Action required: asset verification correction — {cycle.name}",
+        subject=f"Action required: asset verification review — {cycle.name}",
         body=(
             f"Hi {employee.get_full_name() or employee.email},\n\n"
             f"Your asset verification for cycle '{cycle.name}' has been reviewed.{note_section}\n\n"
             f"Results:\n"
             f"  • {approved_count} asset(s) approved\n"
-            f"  • {correction_count} asset(s) require correction\n\n"
+            f"  • {correction_count} asset(s) require correction\n"
+            f"{missing_line}\n"
             f"Please use the link below to review the flagged asset(s) and resubmit:\n{verify_url}\n\n"
             f"Only the asset(s) requiring correction need to be updated. "
-            f"Already-approved assets are locked.\n\n"
+            f"Already-approved assets are locked. Missing assets are recorded and will be investigated.\n\n"
             f"If you have questions, please contact your administrator."
         ),
         template_code="verification_correction",
@@ -818,13 +813,12 @@ class PublicUploadAssetPhotoView(APIView):
             return Response({"detail": "Asset not found."}, status=status.HTTP_404_NOT_FOUND)
 
         existing_response = AssetVerificationResponse.objects.filter(request_asset=ra).first()
-        if (
-            existing_response
-            and existing_response.admin_review_status
-            == AssetVerificationResponse.AdminReviewStatus.APPROVED
+        if existing_response and existing_response.admin_review_status in (
+            AssetVerificationResponse.AdminReviewStatus.APPROVED,
+            AssetVerificationResponse.AdminReviewStatus.MISSING,
         ):
             return Response(
-                {"detail": "This asset has already been approved and is locked."},
+                {"detail": "This asset is locked and cannot accept new photos."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -846,6 +840,81 @@ class PublicUploadAssetPhotoView(APIView):
         from verification.serializers import VerificationAssetPhotoSerializer
         serializer = VerificationAssetPhotoSerializer(photo, context={"request": request})
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class PublicDeleteAssetPhotoView(APIView):
+    """DELETE /api/verification/public/{token}/photos/{photo_id}/
+
+    Remove a single uploaded photo while the verification link is still active.
+    Mirrors the lock rules of PublicUploadAssetPhotoView — photos on approved or
+    missing assets cannot be deleted.
+    """
+
+    permission_classes = [AllowAny]
+
+    def delete(self, request, token, photo_id):
+        try:
+            vr = VerificationRequest.objects.get(public_token=token)
+        except VerificationRequest.DoesNotExist:
+            return Response({"detail": "Invalid link."}, status=status.HTTP_404_NOT_FOUND)
+
+        if vr.status not in _EMPLOYEE_ACTIVE_STATUSES:
+            return Response(
+                {"detail": f"This link is not active. Status: {vr.status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            photo = VerificationAssetPhoto.objects.select_related(
+                "request_asset"
+            ).get(pk=photo_id, request_asset__verification_request=vr)
+        except VerificationAssetPhoto.DoesNotExist:
+            return Response({"detail": "Photo not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Honour the same asset-level lock as upload + frontend isLocked rule.
+        ra = photo.request_asset
+        existing_response = AssetVerificationResponse.objects.filter(request_asset=ra).first()
+
+        if existing_response:
+            admin_status = existing_response.admin_review_status
+
+            # Hard locks: approved or missing
+            if admin_status in (
+                AssetVerificationResponse.AdminReviewStatus.APPROVED,
+                AssetVerificationResponse.AdminReviewStatus.MISSING,
+            ):
+                return Response(
+                    {"detail": "This asset is locked and its photos cannot be removed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Superseded correction lock: correction_required asset whose underlying
+            # asset has since been included in a newer (post-dating this VR) request
+            # that is active or approved.  Mirrors _compute_actionable_vra_ids in
+            # serializers.py and the frontend isLocked / isSupersededAsset check.
+            if admin_status == AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED:
+                _post_statuses = [
+                    VerificationRequest.Status.PENDING,
+                    VerificationRequest.Status.OPENED,
+                    VerificationRequest.Status.OTP_VERIFIED,
+                    VerificationRequest.Status.SUBMITTED,
+                    VerificationRequest.Status.CORRECTION_REQUESTED,
+                    VerificationRequest.Status.APPROVED,
+                ]
+                superseded = VerificationRequestAsset.objects.filter(
+                    asset_id=ra.asset_id,
+                    verification_request__created_at__gt=vr.created_at,
+                    verification_request__status__in=_post_statuses,
+                ).exclude(verification_request=vr).exists()
+                if superseded:
+                    return Response(
+                        {"detail": "This asset is locked and its photos cannot be removed."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+        photo.image.delete(save=False)  # remove file from storage
+        photo.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PublicSubmitView(APIView):
@@ -1122,19 +1191,37 @@ class QuickSendVerificationView(APIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-        # Block if active request already exists for this employee+cycle
-        existing_vr = _get_existing_active_vr(cycle, employee)
-        if existing_vr is not None:
-            return Response(
-                {
-                    "detail": (
-                        f"Employee '{employee.email}' already has an active verification request "
-                        f"in cycle '{cycle.code}' (status: {existing_vr.status}). "
-                        f"Complete or cancel it before sending another."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+        # Asset-level conflict check for the single asset
+        existing_vra = (
+            VerificationRequestAsset.objects
+            .filter(
+                asset=asset,
+                verification_request__status__in=list(VerificationRequest.ACTIVE_STATUSES),
             )
+            .select_related("verification_request", "verification_request__cycle", "verification_request__employee")
+            .first()
+        )
+        if existing_vra:
+            existing_vr = existing_vra.verification_request
+            # Non-blocking correction_requested: all assets approved or missing
+            if not (
+                existing_vr.status == VerificationRequest.Status.CORRECTION_REQUESTED
+                and not is_blocking_correction_request(existing_vr)
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            f"Asset '{asset.asset_id}' is already in active verification request "
+                            f"'{existing_vr.reference_code}' (cycle '{existing_vr.cycle.code}'). "
+                            f"An asset cannot be in two active employee requests simultaneously."
+                        ),
+                        "conflict_type": "asset_in_active_request",
+                        "request_reference": existing_vr.reference_code,
+                        "cycle_code": existing_vr.cycle.code,
+                        "asset_id": asset.asset_id,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         ref_code = f"VER-{cycle.code}-{_secrets.token_hex(4).upper()}"
         try:

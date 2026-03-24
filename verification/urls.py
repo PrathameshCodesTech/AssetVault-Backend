@@ -3,6 +3,7 @@ from django.urls import path
 from verification.views import (
     AdminReviewVerificationView,
     CancelVerificationRequestView,
+    PublicDeleteAssetPhotoView,
     PublicReportAssetView,
     PublicSendOtpView,
     PublicSubmitView,
@@ -34,6 +35,7 @@ urlpatterns = [
     path("public/<str:token>/otp/send/", PublicSendOtpView.as_view(), name="public-otp-send"),
     path("public/<str:token>/otp/verify/", PublicVerifyOtpView.as_view(), name="public-otp-verify"),
     path("public/<str:token>/assets/<uuid:asset_id>/photos/", PublicUploadAssetPhotoView.as_view(), name="public-asset-photo-upload"),
+    path("public/<str:token>/photos/<uuid:photo_id>/", PublicDeleteAssetPhotoView.as_view(), name="public-asset-photo-delete"),
     path("public/<str:token>/report-asset/", PublicReportAssetView.as_view(), name="public-report-asset"),
     path("public/<str:token>/submit/", PublicSubmitView.as_view(), name="public-submit"),
 ]

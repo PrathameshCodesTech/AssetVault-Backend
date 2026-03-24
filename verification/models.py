@@ -90,6 +90,11 @@ class VerificationRequest(models.Model):
         EXPIRED = "expired", "Expired"
         CANCELLED = "cancelled", "Cancelled"
 
+    class RequestType(models.TextChoices):
+        INITIAL = "initial", "Initial"
+        DELTA = "delta", "Delta"
+        REVERIFICATION = "reverification", "Reverification"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     cycle = models.ForeignKey(
@@ -129,6 +134,17 @@ class VerificationRequest(models.Model):
         max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True
     )
 
+    # Batch type — identifies the purpose of this request for audit and UI labelling.
+    # initial: first verification for these assets in the cycle
+    # delta: assets added or newly mapped after the initial send
+    # reverification: assets being re-verified after mark-found or admin reset
+    request_type = models.CharField(
+        max_length=20,
+        choices=RequestType.choices,
+        default=RequestType.INITIAL,
+        db_index=True,
+    )
+
     # Admin review notes — set by admin when approving/rejecting
     review_notes = models.TextField(blank=True, null=True)
 
@@ -142,10 +158,13 @@ class VerificationRequest(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    # Statuses where the employee is still expected to act — only one of these
-    # may exist per employee per cycle at any time. Terminal statuses (submitted,
-    # expired, cancelled) are historical and do not block a new request.
-    ACTIVE_STATUSES = {Status.PENDING, Status.OPENED, Status.OTP_VERIFIED, Status.REJECTED, Status.CORRECTION_REQUESTED}
+    # Statuses where the employee is still expected to act. Used for asset-level
+    # overlap detection: the same asset cannot appear in two requests whose status
+    # is in this set simultaneously.  Terminal statuses (submitted, approved,
+    # expired, cancelled) are historical and do not block asset inclusion in a
+    # new request.  Multiple requests per employee per cycle are allowed as long
+    # as their asset sets do not overlap.
+    ACTIVE_STATUSES = {Status.PENDING, Status.OPENED, Status.OTP_VERIFIED, Status.SUBMITTED, Status.REJECTED, Status.CORRECTION_REQUESTED}
 
     class Meta:
         db_table = "verification_request"
@@ -158,23 +177,6 @@ class VerificationRequest(models.Model):
             models.Index(fields=["status"], name="verif_req_status_idx"),
             models.Index(fields=["expires_at"], name="verif_req_expires_at_idx"),
         ]
-
-    def clean(self):
-        # Block creating/activating a second open request for the same employee+cycle.
-        # Terminal requests (submitted / expired / cancelled) are allowed to co-exist.
-        if self.status in self.ACTIVE_STATUSES and self.cycle_id and self.employee_id:
-            qs = VerificationRequest.objects.filter(
-                cycle_id=self.cycle_id,
-                employee_id=self.employee_id,
-                status__in=self.ACTIVE_STATUSES,
-            )
-            if self.pk:
-                qs = qs.exclude(pk=self.pk)
-            if qs.exists():
-                raise ValidationError(
-                    "This employee already has an active verification request in this cycle. "
-                    "Cancel or expire it before issuing a new one."
-                )
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -254,6 +256,7 @@ class AssetVerificationResponse(models.Model):
         PENDING_REVIEW = "pending_review", "Pending Review"
         APPROVED = "approved", "Approved"
         CORRECTION_REQUIRED = "correction_required", "Correction Required"
+        MISSING = "missing", "Missing"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request_asset = models.OneToOneField(
@@ -487,3 +490,23 @@ class EmployeeReportPhoto(models.Model):
 
     def __str__(self):
         return f"Photo for report {self.report_id}"
+
+
+# ---------------------------------------------------------------------------
+# Shared blocking helper — used by models.clean(), request_service, and views
+# ---------------------------------------------------------------------------
+
+def is_blocking_correction_request(vr):
+    """
+    Return True if a correction_requested VerificationRequest still blocks
+    sending a fresh request for the same employee.
+
+    A correction_requested request is blocking only when at least one linked
+    AssetVerificationResponse still has admin_review_status = correction_required.
+    If all reviewed assets are only approved or missing, the request is
+    considered non-blocking and a new request may be created.
+    """
+    return AssetVerificationResponse.objects.filter(
+        request_asset__verification_request=vr,
+        admin_review_status=AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED,
+    ).exists()

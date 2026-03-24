@@ -29,7 +29,12 @@ class LocationNodeListView(ListAPIView):
     serializer_class = LocationNodeSerializer
 
     def get_queryset(self):
+        from access.helpers import get_user_scope
         qs = LocationNode.objects.filter(is_active=True).select_related("location_type")
+
+        scope = get_user_scope(self.request.user)
+        if not scope["is_global"] and scope["location_ids"]:
+            qs = qs.filter(pk__in=scope["location_ids"])
 
         parent_id = self.request.query_params.get("parent_id") or self.request.query_params.get("parent")
         if parent_id:

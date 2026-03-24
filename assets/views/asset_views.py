@@ -61,10 +61,12 @@ __all__ = [
     "AssetDetailView",
     "AssetHistoryView",
     "AssetAssignView",
+    "BulkAssignView",
     "AssetMoveView",
     "AssetScanView",
     "AssetQRView",
     "AssetLookupsView",
+    "MarkFoundView",
 ]
 
 
@@ -135,10 +137,19 @@ def _apply_image(asset, image_file):
 def _annotate_employee_workflows(assets):
     """
     For each Asset in *assets* (already fetched), attach an ``_employee_workflow``
-    attribute containing the active employee verification info, or None.
+    attribute containing the current employee verification info, or None.
 
-    Covers active request statuses only (not terminal approved/cancelled).
-    Uses two extra queries total — not N+1.
+    Selection priority per asset (resolves current operational truth, not historical):
+      1. Truly open requests (PENDING / OPENED / OTP_VERIFIED) — newest first.
+      2. All other relevant rows (SUBMITTED, CORRECTION_REQUESTED, APPROVED)
+         — newest first by updated_at.
+
+    This ensures a newer APPROVED request beats an older CORRECTION_REQUESTED/missing
+    row, so that Mark Found + fresh approval correctly clears the stale missing badge.
+    History (old request detail pages, Employee Requests list) is unaffected because
+    this function only drives the /assets row workflow badge.
+
+    Uses a single query — not N+1.
     """
     if not assets:
         return
@@ -148,65 +159,63 @@ def _annotate_employee_workflows(assets):
         AssetVerificationResponse,
     )
 
-    _active = [
+    _considered = [
         VerificationRequest.Status.PENDING,
         VerificationRequest.Status.OPENED,
         VerificationRequest.Status.OTP_VERIFIED,
         VerificationRequest.Status.SUBMITTED,
         VerificationRequest.Status.CORRECTION_REQUESTED,
+        VerificationRequest.Status.APPROVED,
     ]
+    _open_statuses = {
+        VerificationRequest.Status.PENDING,
+        VerificationRequest.Status.OPENED,
+        VerificationRequest.Status.OTP_VERIFIED,
+    }
     asset_ids = [a.pk for a in assets]
 
     rows = list(
         VerificationRequestAsset.objects
-        .filter(asset_id__in=asset_ids, verification_request__status__in=_active)
+        .filter(asset_id__in=asset_ids, verification_request__status__in=_considered)
         .values(
             "asset_id", "id",
             "verification_request__id",
             "verification_request__reference_code",
             "verification_request__status",
+            "verification_request__updated_at",
             "verification_request__employee__first_name",
             "verification_request__employee__last_name",
         )
     )
 
-    # One row per asset (cross-flow guards prevent duplicates)
-    emp_map = {}  # asset_id -> row
+    # Sort so that the best row per asset appears first:
+    #   tier 0 = truly open (always wins regardless of age)
+    #   tier 1 = everything else, ordered newest-first
+    # setdefault below keeps only the first (best) row per asset.
+    def _sort_key(r):
+        tier = 0 if r["verification_request__status"] in _open_statuses else 1
+        ts = r["verification_request__updated_at"]
+        recency = -(ts.timestamp() if ts is not None else 0)
+        return (tier, recency)
+
+    rows.sort(key=_sort_key)
+
+    emp_map = {}  # asset_id -> best row
     for row in rows:
         emp_map.setdefault(row["asset_id"], row)
 
-    # Secondary: fill in approved terminal state for assets with no active request
-    unmatched_ids = [pk for pk in asset_ids if pk not in emp_map]
-    if unmatched_ids:
-        approved_rows = list(
-            VerificationRequestAsset.objects
-            .filter(
-                asset_id__in=unmatched_ids,
-                verification_request__status=VerificationRequest.Status.APPROVED,
-            )
-            .order_by("-verification_request__updated_at")
-            .values(
-                "asset_id", "id",
-                "verification_request__id",
-                "verification_request__reference_code",
-                "verification_request__status",
-                "verification_request__employee__first_name",
-                "verification_request__employee__last_name",
-            )
-        )
-        # Keep only the most recent approved row per asset
-        for row in approved_rows:
-            emp_map.setdefault(row["asset_id"], row)
-
-    # For SUBMITTED requests, get per-asset admin review status (one extra query)
-    submitted_vra_ids = [
+    # For SUBMITTED and CORRECTION_REQUESTED requests, get per-asset admin review status
+    review_needed_vra_ids = [
         row["id"] for row in emp_map.values()
-        if row["verification_request__status"] == VerificationRequest.Status.SUBMITTED
+        if row["verification_request__status"] in (
+            VerificationRequest.Status.SUBMITTED,
+            VerificationRequest.Status.CORRECTION_REQUESTED,
+        )
     ]
     review_map = {}
-    if submitted_vra_ids:
+    if review_needed_vra_ids:
         for r in AssetVerificationResponse.objects.filter(
-            request_asset_id__in=submitted_vra_ids
+            request_asset_id__in=review_needed_vra_ids
         ).values("request_asset_id", "admin_review_status"):
             review_map[r["request_asset_id"]] = r["admin_review_status"]
 
@@ -219,14 +228,22 @@ def _annotate_employee_workflows(assets):
             if review == AssetVerificationResponse.AdminReviewStatus.APPROVED:
                 return "approved", "Approved"
             if review == AssetVerificationResponse.AdminReviewStatus.CORRECTION_REQUIRED:
-                return "correction_requested", "Correction Requested"
+                return "correction_requested", "Verification Findings"
+            if review == AssetVerificationResponse.AdminReviewStatus.MISSING:
+                return "missing", "Missing"
             return "under_review", "Under Review"
         if req_status == VerificationRequest.Status.PENDING:
             return "sent", "Sent"
         if req_status in (VerificationRequest.Status.OPENED, VerificationRequest.Status.OTP_VERIFIED):
             return "opened", "Opened"
         if req_status == VerificationRequest.Status.CORRECTION_REQUESTED:
-            return "correction_requested", "Correction Requested"
+            # Per-asset resolution: approved/missing assets keep their individual status
+            review = review_map.get(row["id"])
+            if review == AssetVerificationResponse.AdminReviewStatus.APPROVED:
+                return "approved", "Approved"
+            if review == AssetVerificationResponse.AdminReviewStatus.MISSING:
+                return "missing", "Missing"
+            return "correction_requested", "Verification Findings"
         return "in_progress", "In Progress"
 
     for asset in assets:
@@ -390,7 +407,38 @@ class AssetListCreateView(APIView):
 
         location_id = request.query_params.get("location_id")
         if location_id:
-            qs = qs.filter(current_location_id=location_id)
+            from locations.models import LocationClosure
+            subtree_ids = set(
+                LocationClosure.objects.filter(ancestor_id=location_id).values_list("descendant_id", flat=True)
+            )
+            if not subtree_ids:
+                subtree_ids = {location_id}
+            qs = qs.filter(current_location_id__in=subtree_ids)
+
+        location_admin_id = request.query_params.get("location_admin_id")
+        if location_admin_id:
+            from access.models import UserRoleAssignment
+            from locations.models import LocationClosure
+            scope = get_user_scope(request.user)
+            admin_root_ids = set(
+                UserRoleAssignment.objects.filter(
+                    user_id=location_admin_id,
+                    is_active=True,
+                    role__code="location_admin",
+                ).exclude(location__isnull=True).values_list("location_id", flat=True)
+            )
+            if not admin_root_ids:
+                return Response(
+                    {"detail": "location_admin_id does not refer to an active location admin."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            admin_subtree = set(
+                LocationClosure.objects.filter(ancestor_id__in=admin_root_ids).values_list("descendant_id", flat=True)
+            )
+            if scope["is_global"]:
+                qs = qs.filter(current_location_id__in=admin_subtree)
+            else:
+                qs = qs.filter(current_location_id__in=admin_subtree & scope["location_ids"])
 
         assigned_to = request.query_params.get("assigned_to")
         if assigned_to:
@@ -419,38 +467,35 @@ class AssetListCreateView(APIView):
             )
 
         vendor_id = request.query_params.get("vendor_id")
-        if vendor_id:
-            from vendors.models import VendorVerificationRequest, VendorVerificationRequestAsset
-            _vendor_active = [
-                VendorVerificationRequest.Status.DRAFT,
-                VendorVerificationRequest.Status.SENT,
-                VendorVerificationRequest.Status.IN_PROGRESS,
-                VendorVerificationRequest.Status.SUBMITTED,
-                VendorVerificationRequest.Status.CORRECTION_REQUESTED,
-            ]
-            vendor_reserved_ids = VendorVerificationRequestAsset.objects.filter(
-                request__vendor_id=vendor_id,
-                request__status__in=_vendor_active,
-            ).values_list("asset_id", flat=True)
-            qs = qs.filter(pk__in=vendor_reserved_ids)
-
         vendor_linked = request.query_params.get("vendor_linked")
-        if vendor_linked is not None:
+
+        if vendor_id or vendor_linked is not None:
             from vendors.models import VendorVerificationRequest, VendorVerificationRequestAsset
-            _vendor_active = [
+            # All non-cancelled statuses — approved assets are still vendor-owned/visible
+            _vendor_linked_statuses = [
                 VendorVerificationRequest.Status.DRAFT,
                 VendorVerificationRequest.Status.SENT,
                 VendorVerificationRequest.Status.IN_PROGRESS,
                 VendorVerificationRequest.Status.SUBMITTED,
                 VendorVerificationRequest.Status.CORRECTION_REQUESTED,
+                VendorVerificationRequest.Status.APPROVED,
             ]
-            vendor_reserved_ids = VendorVerificationRequestAsset.objects.filter(
-                request__status__in=_vendor_active,
-            ).values_list("asset_id", flat=True)
-            if vendor_linked.lower() in ("true", "1"):
+
+            if vendor_id:
+                vendor_reserved_ids = VendorVerificationRequestAsset.objects.filter(
+                    request__vendor_id=vendor_id,
+                    request__status__in=_vendor_linked_statuses,
+                ).values_list("asset_id", flat=True)
                 qs = qs.filter(pk__in=vendor_reserved_ids)
-            else:
-                qs = qs.exclude(pk__in=vendor_reserved_ids)
+
+            if vendor_linked is not None:
+                all_vendor_linked_ids = VendorVerificationRequestAsset.objects.filter(
+                    request__status__in=_vendor_linked_statuses,
+                ).values_list("asset_id", flat=True)
+                if vendor_linked.lower() in ("true", "1"):
+                    qs = qs.filter(pk__in=all_vendor_linked_ids)
+                else:
+                    qs = qs.exclude(pk__in=all_vendor_linked_ids)
 
         ordering = request.query_params.get("ordering", "-created_at")
         allowed_orderings = {
@@ -834,6 +879,182 @@ class AssetAssignView(APIView):
             {"detail": "Asset assigned.", "assignment_id": str(assignment.pk)},
             status=status.HTTP_200_OK,
         )
+
+
+class BulkAssignView(APIView):
+    """POST /api/assets/assign/bulk/ — assign multiple assets to one employee."""
+
+    permission_classes = [IsAuthenticated, permission_required("asset.assign")]
+
+    def post(self, request):
+        from accounts.models import User
+
+        user_id = request.data.get("user_id")
+        asset_ids = request.data.get("asset_ids", [])
+        note = request.data.get("note", "")
+        force_reassign = str(request.data.get("force_reassign", "false")).lower() in ("true", "1")
+
+        if not user_id:
+            return Response({"detail": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not asset_ids or not isinstance(asset_ids, list):
+            return Response({"detail": "asset_ids must be a non-empty list."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            employee = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Load and scope-check all assets first
+        assets_list = []
+        for aid in asset_ids:
+            try:
+                asset = Asset.objects.select_related("current_location").get(pk=aid)
+            except Asset.DoesNotExist:
+                return Response(
+                    {"detail": f"Asset {aid} not found.", "conflict_type": "asset_not_found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if not _check_asset_in_scope(asset, request.user):
+                return Response(
+                    {"detail": f"Asset {asset.asset_id} is outside your location scope.", "conflict_type": "out_of_scope"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            assets_list.append(asset)
+
+        # Pre-validate all conflict types
+        from verification.models import VerificationRequest, VerificationRequestAsset as VRA
+
+        vendor_conflicts = []
+        employee_conflicts = []  # each entry: {asset, asset_id_str, request_reference, employee_name, vra}
+
+        try:
+            from vendors.models import VendorVerificationRequest, VendorVerificationRequestAsset
+            _ACTIVE_VENDOR_STATUSES = [
+                VendorVerificationRequest.Status.SENT,
+                VendorVerificationRequest.Status.IN_PROGRESS,
+                VendorVerificationRequest.Status.SUBMITTED,
+                VendorVerificationRequest.Status.CORRECTION_REQUESTED,
+            ]
+            vendor_conflict_assets = set(
+                VendorVerificationRequestAsset.objects
+                .filter(asset__in=assets_list, request__status__in=_ACTIVE_VENDOR_STATUSES)
+                .select_related("asset", "request")
+                .values_list("asset_id", "request__reference_code")
+            )
+            for asset_uuid, ref in vendor_conflict_assets:
+                vendor_conflicts.append({"asset_id": str(asset_uuid), "request_reference": ref})
+        except ImportError:
+            pass
+
+        active_vras = (
+            VRA.objects
+            .filter(asset__in=assets_list, verification_request__status__in=list(VerificationRequest.ACTIVE_STATUSES))
+            .select_related("asset", "verification_request", "verification_request__employee")
+        )
+        for vra in active_vras:
+            emp = vra.verification_request.employee
+            employee_conflicts.append({
+                "asset": vra.asset,
+                "asset_id": vra.asset.asset_id,
+                "request_reference": vra.verification_request.reference_code,
+                "employee_name": emp.get_full_name() or emp.email,
+                "employee_email": emp.email,
+                "vra": vra,
+            })
+
+        # Hard block on vendor conflicts — no override
+        if vendor_conflicts:
+            return Response(
+                {
+                    "detail": f"{len(vendor_conflicts)} asset(s) are part of active vendor requests and cannot be reassigned.",
+                    "conflict_type": "active_vendor_request",
+                    "conflicts": vendor_conflicts,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Employee request conflict — block unless force_reassign
+        if employee_conflicts and not force_reassign:
+            return Response(
+                {
+                    "detail": (
+                        f"{len(employee_conflicts)} asset(s) are in active employee verification requests. "
+                        f"Pass force_reassign=true to override."
+                    ),
+                    "conflict_type": "active_employee_request",
+                    "conflicts": [
+                        {
+                            "asset_id": ec["asset_id"],
+                            "request_reference": ec["request_reference"],
+                            "employee_name": ec["employee_name"],
+                        }
+                        for ec in employee_conflicts
+                    ],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # All clear — assign all assets atomically
+        from django.utils import timezone as _tz
+        start_at = _tz.now()
+
+        try:
+            with transaction.atomic():
+                if force_reassign and employee_conflicts:
+                    from verification.services.request_service import cancel_verification_request
+                    for ec in employee_conflicts:
+                        vra = ec["vra"]
+                        old_request = vra.verification_request
+                        vra.delete()
+                        if old_request.request_assets.count() == 0:
+                            try:
+                                cancel_verification_request(old_request, cancelled_by=request.user)
+                            except Exception:
+                                pass
+
+                for asset in assets_list:
+                    assign_asset(asset, employee, start_at, assigned_by=request.user, note=note)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"detail": "Assets assigned.", "assigned_count": len(assets_list)},
+            status=status.HTTP_200_OK,
+        )
+
+
+class MarkFoundView(APIView):
+    """POST /api/assets/{id}/mark-found/ — restore a missing asset to active status."""
+
+    permission_classes = [IsAuthenticated, permission_required("asset.update")]
+
+    def post(self, request, pk):
+        try:
+            asset = Asset.objects.get(pk=pk)
+        except Asset.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _check_asset_in_scope(asset, request.user):
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if asset.status != Asset.Status.MISSING:
+            return Response(
+                {"detail": "Asset is not currently marked as missing."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        note = (request.data.get("note") or "").strip()
+        asset.status = Asset.Status.ACTIVE
+        asset.save(update_fields=["status", "updated_at"])
+
+        create_asset_event(
+            asset,
+            AssetEvent.EventType.UPDATED,
+            actor=request.user,
+            description=note or "Asset marked as found and restored to active.",
+        )
+
+        return Response({"detail": "Asset restored to active.", "status": asset.status})
 
 
 class AssetMoveView(APIView):

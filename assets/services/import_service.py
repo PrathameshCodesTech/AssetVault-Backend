@@ -13,6 +13,7 @@ from datetime import datetime
 from django.db import transaction
 from django.utils import timezone
 
+from access.helpers import location_in_scope
 from assets.models import (
     Asset,
     AssetCategory,
@@ -141,7 +142,7 @@ def _can_parse_date(value):
 
 
 @transaction.atomic
-def validate_import_rows(job: AssetImportJob, parsed_rows: list[dict]) -> None:
+def validate_import_rows(job: AssetImportJob, parsed_rows: list[dict], user=None) -> None:
     """
     Validate parsed rows and persist AssetImportRow records.
     """
@@ -150,7 +151,7 @@ def validate_import_rows(job: AssetImportJob, parsed_rows: list[dict]) -> None:
 
     # Pre-load lookups for FK validation
     active_categories = list(AssetCategory.objects.filter(is_active=True).values("code", "name"))
-    active_locations = list(LocationNode.objects.filter(is_active=True).values("code", "name"))
+    active_locations = list(LocationNode.objects.filter(is_active=True).values("id", "code", "name"))
     active_entities = list(BusinessEntity.objects.filter(is_active=True).values("code", "name"))
     active_cost_centers = list(CostCenter.objects.filter(is_active=True).values("code", "name"))
     active_suppliers = list(Supplier.objects.filter(is_active=True).values("name"))
@@ -164,6 +165,12 @@ def validate_import_rows(job: AssetImportJob, parsed_rows: list[dict]) -> None:
     category_names = {row["name"] for row in active_categories}
     location_codes = {row["code"] for row in active_locations}
     location_names = {row["name"] for row in active_locations}
+    location_lookup = {}
+    for row in active_locations:
+        if row["code"]:
+            location_lookup[row["code"]] = row
+        if row["name"]:
+            location_lookup[row["name"]] = row
     entity_codes = {row["code"] for row in active_entities}
     entity_names = {row["name"] for row in active_entities}
     cost_center_codes = {row["code"] for row in active_cost_centers}
@@ -198,6 +205,10 @@ def validate_import_rows(job: AssetImportJob, parsed_rows: list[dict]) -> None:
         loc_code = _as_text(raw_data.get("location_code"))
         if loc_code and loc_code not in location_codes and loc_code not in location_names:
             errors.append(f"Unknown location: {loc_code}")
+        elif user and loc_code:
+            location_row = location_lookup.get(loc_code)
+            if location_row and not location_in_scope(location_row["id"], user):
+                errors.append(f"Location outside your allowed scope: {loc_code}")
 
         entity_code = _as_text(raw_data.get("entity_code"))
         if entity_code and entity_code not in entity_codes and entity_code not in entity_names:
@@ -417,6 +428,15 @@ def process_import_job(job: AssetImportJob, created_by=None) -> dict:
             if not location:
                 errors.append(f"Location not found: {data.get('location_code')}")
             row.error_message = "; ".join(errors)
+            row.save(update_fields=["status", "error_message", "updated_at"])
+            fail_count += 1
+            continue
+
+        if created_by and not location_in_scope(location.pk, created_by):
+            row.status = AssetImportRow.Status.INVALID
+            row.error_message = (
+                f"Location '{location.code or location.name}' is outside your allowed scope."
+            )
             row.save(update_fields=["status", "error_message", "updated_at"])
             fail_count += 1
             continue

@@ -183,6 +183,15 @@ class UserListView(ListAPIView):
 
     def get_queryset(self):
         qs = User.objects.filter(is_active=True).order_by("first_name", "email")
+
+        role = self.request.query_params.get("role", "").strip()
+        if role:
+            from access.models import UserRoleAssignment
+            user_ids = UserRoleAssignment.objects.filter(
+                role__code=role, is_active=True
+            ).values_list("user_id", flat=True)
+            qs = qs.filter(pk__in=user_ids)
+
         search = self.request.query_params.get("search", "").strip()
         if search:
             qs = qs.filter(
@@ -191,3 +200,57 @@ class UserListView(ListAPIView):
                 | Q(last_name__icontains=search)
             )
         return qs
+
+
+class LocationAdminListView(ListAPIView):
+    """
+    GET /api/auth/location-admins/ — list users with active location_admin role.
+
+    Returns id, name, email and their assigned location name(s).
+    Only accessible by super_admin.
+    """
+
+    permission_classes = [IsAuthenticated]
+    pagination_class = None
+
+    def get(self, request):
+        from access.helpers import get_user_scope
+        from access.models import UserRoleAssignment
+
+        scope = get_user_scope(request.user)
+        if scope.get("primary_role_code") != "super_admin":
+            from rest_framework.response import Response as _Response
+            return _Response({"detail": "Forbidden."}, status=403)
+
+        search = request.query_params.get("search", "").strip()
+
+        assignments = (
+            UserRoleAssignment.objects.filter(is_active=True, role__code="location_admin")
+            .select_related("user", "location")
+            .order_by("user__first_name", "user__email")
+        )
+
+        if search:
+            assignments = assignments.filter(
+                Q(user__first_name__icontains=search)
+                | Q(user__last_name__icontains=search)
+                | Q(user__email__icontains=search)
+                | Q(location__name__icontains=search)
+            )
+
+        # Deduplicate users, collecting all their location assignments
+        seen = {}
+        for a in assignments:
+            uid = str(a.user_id)
+            if uid not in seen:
+                seen[uid] = {
+                    "id": uid,
+                    "name": a.user.get_full_name() or a.user.email,
+                    "email": a.user.email,
+                    "locations": [],
+                }
+            if a.location_id:
+                seen[uid]["locations"].append({"id": str(a.location_id), "name": a.location.name})
+
+        from rest_framework.response import Response as _Response
+        return _Response(list(seen.values()))
