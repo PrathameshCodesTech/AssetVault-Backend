@@ -5,10 +5,37 @@ Handles core operations on Asset records: registration, assignment,
 movement, and event logging. All mutating operations that touch more than
 one table are wrapped in transactions.
 """
+import re
+
 from django.db import transaction
 from django.utils import timezone
 
 from assets.models import Asset, AssetAssignment, AssetEvent, AssetFinancialDetail, AssetWFHDetail
+
+# ---------------------------------------------------------------------------
+# Code resolution
+# ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def resolve_asset_by_code(code: str):
+    """Return the Asset matching *code*, or None.
+
+    Resolution order:
+      1. UUID-shaped  -> qr_uid
+      2. Otherwise    -> asset_id exact match
+      3. Otherwise    -> tag_number exact match
+    """
+    if _UUID_RE.match(code):
+        return Asset.objects.filter(qr_uid=code).first()
+    asset = Asset.objects.filter(asset_id=code).first()
+    if asset is not None:
+        return asset
+    return Asset.objects.filter(tag_number=code).first()
 
 
 # ---------------------------------------------------------------------------

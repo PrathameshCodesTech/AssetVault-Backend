@@ -10,6 +10,7 @@ from assets.views.asset_views import (
     AssetMoveView,
     AssetQRView,
     AssetScanView,
+    AssetScanByCodeView,
     MarkFoundView,
 )
 from assets.views.bulk_upload_views import (
@@ -32,6 +33,7 @@ urlpatterns = [
     path("<uuid:pk>/move/", AssetMoveView.as_view(), name="move"),
     path("<uuid:pk>/qr/", AssetQRView.as_view(), name="qr"),
     path("scan/<uuid:qr_uid>/", AssetScanView.as_view(), name="scan"),
+    path("scan-lookup/<str:code>/", AssetScanByCodeView.as_view(), name="scan-lookup"),
     path("lookups/", AssetLookupsView.as_view(), name="lookups"),
     # Bulk upload
     path("upload/preview/", BulkUploadPreviewView.as_view(), name="upload-preview"),

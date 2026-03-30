@@ -1120,6 +1120,34 @@ class AssetScanView(APIView):
         return Response(serializer.data)
 
 
+class AssetScanByCodeView(APIView):
+    """GET /api/assets/scan-lookup/{code}/ — lookup asset by asset_id or tag_number (barcode)."""
+
+    permission_classes = [IsAuthenticated, permission_required("asset.view")]
+
+    def get(self, request, code):
+        from assets.services.asset_service import resolve_asset_by_code
+
+        asset = resolve_asset_by_code(code)
+        if asset is None:
+            return Response({"detail": "Asset not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Re-fetch with full select_related for the serializer
+        try:
+            asset = Asset.objects.select_related(
+                "category", "sub_type", "business_entity",
+                "current_location", "current_location__location_type", "assigned_to",
+            ).get(pk=asset.pk)
+        except Asset.DoesNotExist:
+            return Response({"detail": "Asset not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _check_asset_in_scope(asset, request.user):
+            return Response({"detail": "Asset not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = AssetDetailSerializer(asset, context={"request": request})
+        return Response(serializer.data)
+
+
 class AssetQRView(APIView):
     """GET /api/assets/{id}/qr/ — generate QR code image (location-scoped)."""
 

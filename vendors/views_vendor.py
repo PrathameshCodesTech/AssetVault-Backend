@@ -267,10 +267,11 @@ class VendorGlobalScanView(APIView):
 
         qr_uid = request.data.get("qr_uid")
         asset_id = request.data.get("asset_id")
+        tag_number = request.data.get("tag_number")
 
-        if not qr_uid and not asset_id:
+        if not qr_uid and not asset_id and not tag_number:
             return Response(
-                {"detail": "Provide qr_uid or asset_id in request body."},
+                {"detail": "Provide qr_uid, asset_id, or tag_number in request body."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -281,6 +282,10 @@ class VendorGlobalScanView(APIView):
             asset = Asset.objects.filter(qr_uid=qr_uid).first()
         elif asset_id:
             asset = Asset.objects.filter(asset_id=asset_id).first()
+            if asset is None:
+                asset = Asset.objects.filter(tag_number=asset_id).first()
+        elif tag_number:
+            asset = Asset.objects.filter(tag_number=tag_number).first()
 
         if asset is None:
             return Response(
@@ -376,10 +381,11 @@ class VendorRequestScanView(APIView):
 
         qr_uid = request.query_params.get("qr_uid")
         asset_id = request.query_params.get("asset_id")
+        tag_number = request.query_params.get("tag_number")
 
-        if not qr_uid and not asset_id:
+        if not qr_uid and not asset_id and not tag_number:
             return Response(
-                {"detail": "Provide qr_uid or asset_id query parameter."},
+                {"detail": "Provide qr_uid, asset_id, or tag_number query parameter."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -390,6 +396,10 @@ class VendorRequestScanView(APIView):
             asset = Asset.objects.filter(qr_uid=qr_uid).first()
         elif asset_id:
             asset = Asset.objects.filter(asset_id=asset_id).first()
+            if asset is None:
+                asset = Asset.objects.filter(tag_number=asset_id).first()
+        elif tag_number:
+            asset = Asset.objects.filter(tag_number=tag_number).first()
 
         if asset is None:
             return Response({"detail": "Asset not found.", "in_package": False}, status=status.HTTP_404_NOT_FOUND)
